@@ -200,7 +200,15 @@ class SqueezeAttentionModelRunner:
         return signals
 
     def _capture_prefill_importance(self, scheduler_output: Any) -> None:
-        """Slice per-token layer similarities into per-request accumulators."""
+        """Compute per-token layer similarities AFTER the forward and slice
+        them into per-request accumulators.
+
+        The hooks only store tensor references (the forward must stay
+        transparent to torch.compile); the actual cosine-similarity math runs
+        here, outside any compiled region.
+        """
+        import torch.nn.functional as F  # noqa: PLC0415
+
         input_batch = getattr(self._base_runner, "input_batch", None)
         num_reqs = int(getattr(input_batch, "num_reqs", 0)) if input_batch else 0
         if num_reqs <= 0:
@@ -230,17 +238,27 @@ class SqueezeAttentionModelRunner:
 
         num_layers = self.hooks.layer_count
         for layer_idx in range(num_layers):
-            sims = self.hooks.get_similarities(layer_idx)
-            if sims is None:
+            pair = self.hooks.get_capture_pair(layer_idx)
+            if pair is None:
                 continue
-            for idx, state in state_by_idx.items():
-                token_indices = np.nonzero(req_indices == idx)[0]
-                if token_indices.size == 0:
-                    continue
-                start, end = int(token_indices[0]), int(token_indices[-1]) + 1
-                accumulator = state.extra.get("importance")
-                if accumulator is not None:
-                    accumulator.add(layer_idx, sims, start, end)
+            try:
+                layer_input, attn_out = pair
+                # Paper's hidd_data: cosine similarity between the layer input
+                # and the post-attention residual output.
+                residual = layer_input.float() + attn_out.float()
+                sims = F.cosine_similarity(layer_input.float(), residual, dim=-1)
+                for idx, state in state_by_idx.items():
+                    token_indices = np.nonzero(req_indices == idx)[0]
+                    if token_indices.size == 0:
+                        continue
+                    start, end = int(token_indices[0]), int(token_indices[-1]) + 1
+                    accumulator = state.extra.get("importance")
+                    if accumulator is not None:
+                        accumulator.add(layer_idx, sims, start, end)
+            except Exception:  # pragma: no cover - capture must never break serving
+                pass
+            finally:
+                self.hooks.clear_capture_pair(layer_idx)
 
     def _maybe_finalize_budgets(self, scheduler_output: Any) -> None:
         """After a request's prefill completes, run KMeans budget allocation."""
@@ -492,7 +510,6 @@ class SqueezeAttentionModelRunner:
         self._cleanup_finished(scheduler_output)
         self._sync_worker_num_computed(scheduler_output)
 
-        self._capture_prefill_importance(scheduler_output)
         self._maybe_finalize_budgets(scheduler_output)
 
         signals = self._consume_signals(scheduler_output)
@@ -511,6 +528,10 @@ class SqueezeAttentionModelRunner:
             )
         finally:
             self._advance_compressed_lengths(scheduler_output)
+
+        # Layer-importance capture runs AFTER the forward (outside any
+        # compiled region): the hooks stored references only.
+        self._capture_prefill_importance(scheduler_output)
 
         output, remaining = attach_events_to_output(output, events, scheduler_output)
         self._pending_compression_events = remaining

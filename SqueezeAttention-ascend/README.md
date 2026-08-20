@@ -65,6 +65,15 @@ not physically expressible:
   padding (`SQUEEZE_FAKE_KEY_PADDING=1`) of short-budget layers' tail slots,
   computed per decode step from the current query (kvpress-style hyperplane).
 
+Compile safety: the hooks are fully transparent to `torch.compile` — they only
+store tensor references inside the forward (no tensor ops) and skip capture
+while `torch.compiler.is_compiling()` is true; the cosine-similarity math runs
+in the runner proxy after the forward. npugraph_ex / AOT artifacts stay
+identical to an un-patched run. Note: layer-importance capture (hidd_data)
+therefore requires the prefill step to run eager; under compiled prefill the
+budgets fall back to the uniform initial budget (`SQUEEZE_KV_BUDGET` still
+fixes K).
+
 ## Environment variables
 
 | Env | Default | Meaning |

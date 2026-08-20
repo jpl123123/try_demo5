@@ -44,12 +44,31 @@ def _infer_layer_idx(layer_name: Any, layer_obj: Any, fallback: int) -> int:
     return int(fallback)
 
 
+def _is_compiling() -> bool:
+    """True while torch.compile / dynamo is tracing this code.
+
+    The hooks must be fully transparent to the tracer: tensor ops (or values
+    consumed by Python) inside a traced region become extra graph outputs and
+    desync the npugraph_ex / AOT artifacts (``ValueError: too many values to
+    unpack``). While tracing, the hooks short-circuit to the original forward.
+    """
+    compiler = getattr(torch, "compiler", None)
+    if compiler is None:  # torch < 2.0 (test environments)
+        return False
+    is_compiling = getattr(compiler, "is_compiling", None)
+    try:
+        return bool(is_compiling and is_compiling())
+    except Exception:  # pragma: no cover - never break the forward
+        return False
+
+
 class SqueezeAttentionHooks:
     """Per-layer similarity + query capture hooks on a loaded model."""
 
     def __init__(self) -> None:
         self._layer_similarities: dict[int, torch.Tensor] = {}
         self._layer_inputs: dict[int, torch.Tensor] = {}
+        self._layer_attn_outputs: dict[int, torch.Tensor] = {}
         self._layer_queries: dict[int, torch.Tensor] = {}
         self._hooks: list[Any] = []
         self._layer_count = 0
@@ -78,6 +97,18 @@ class SqueezeAttentionHooks:
     def get_similarities(self, layer_idx: int) -> Optional[torch.Tensor]:
         return self._layer_similarities.get(int(layer_idx))
 
+    def get_capture_pair(self, layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """(layer_input, attn_output) captured this step (references)."""
+        layer_input = self._layer_inputs.get(int(layer_idx))
+        attn_out = self._layer_attn_outputs.get(int(layer_idx))
+        if layer_input is None or attn_out is None:
+            return None
+        return layer_input, attn_out
+
+    def clear_capture_pair(self, layer_idx: int) -> None:
+        self._layer_inputs.pop(int(layer_idx), None)
+        self._layer_attn_outputs.pop(int(layer_idx), None)
+
     def get_query(self, layer_idx: int) -> Optional[torch.Tensor]:
         return self._layer_queries.get(int(layer_idx))
 
@@ -90,6 +121,8 @@ class SqueezeAttentionHooks:
         hooks = self
 
         def _patched_forward(*args, **kwargs):
+            if _is_compiling():
+                return original(*args, **kwargs)
             try:
                 if hooks._enabled:
                     hidden = kwargs.get("hidden_states")
@@ -114,6 +147,8 @@ class SqueezeAttentionHooks:
         hooks = self
 
         def _patched_forward(*args, **kwargs):
+            if _is_compiling():
+                return original(*args, **kwargs)
             try:
                 if hooks._enabled:
                     if hooks.capture_queries:
@@ -128,13 +163,12 @@ class SqueezeAttentionHooks:
                         result = original(*args, **kwargs)
                         attn_out = _first_tensor_like(result)
                         if attn_out is not None and attn_out.shape == layer_input.shape:
-                            # Paper's hidd_data: cosine similarity between the
-                            # layer input and the post-attention residual output.
-                            residual = layer_input + attn_out
-                            sims = F.cosine_similarity(
-                                layer_input.float(), residual.float(), dim=-1
-                            )
-                            hooks._layer_similarities[layer_idx] = sims
+                            # Reference-only capture: the paper's hidd_data
+                            # cosine similarity is computed by the runner proxy
+                            # AFTER the forward (outside any compiled region).
+                            # No tensor ops may run here: they would be traced
+                            # into the compiled graph and change its outputs.
+                            hooks._layer_attn_outputs[layer_idx] = attn_out
                             hooks.note_captured()
                         return result
                 return original(*args, **kwargs)
@@ -192,6 +226,7 @@ class SqueezeAttentionHooks:
         self._hooks.clear()
         self._layer_similarities.clear()
         self._layer_inputs.clear()
+        self._layer_attn_outputs.clear()
         self._layer_queries.clear()
 
     def log_summary(self) -> str:

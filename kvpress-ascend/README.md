@@ -87,6 +87,11 @@ Mask-based (head-wise different counts) presses such as `AdaKVPress`,
 Ascend attention kernels cannot express per-head masking, so those presses are
 not physically realizable here.
 
+Compile safety: the attention hooks are fully transparent to `torch.compile`
+(they short-circuit while `torch.compiler.is_compiling()` is true and perform no
+tensor ops inside the forward), so npugraph_ex / AOT artifacts stay identical to
+an un-patched run — no `too many values to unpack` desync from this package.
+
 ## Simulated-debug tests (no NPU needed)
 
 ```bash

@@ -44,6 +44,25 @@ def _infer_layer_idx(layer_name: str, layer_obj: Any, fallback: int) -> int:
     return int(fallback)
 
 
+def _is_compiling() -> bool:
+    """True while torch.compile / dynamo is tracing this code.
+
+    The hooks must be fully transparent to the tracer: any tensor op (or a
+    value consumed by Python) inside a traced region becomes an extra graph
+    output and can desync the npugraph_ex / AOT compilation artifacts
+    (``ValueError: too many values to unpack``). While tracing, the hooks
+    short-circuit to the original forward untouched.
+    """
+    compiler = getattr(torch, "compiler", None)
+    if compiler is None:  # torch < 2.0 (test environments)
+        return False
+    is_compiling = getattr(compiler, "is_compiling", None)
+    try:
+        return bool(is_compiling and is_compiling())
+    except Exception:  # pragma: no cover - never break the forward
+        return False
+
+
 class AttentionHooks:
     """Registry of per-layer capture hooks installed on a loaded model."""
 
@@ -102,6 +121,8 @@ class AttentionHooks:
         hooks = self
 
         def _patched_forward(*args, **kwargs):
+            if _is_compiling():
+                return original(*args, **kwargs)
             try:
                 if hooks._enabled:
                     # vLLM attention layer signature:
@@ -132,6 +153,8 @@ class AttentionHooks:
         hooks = self
 
         def _patched_forward(*args, **kwargs):
+            if _is_compiling():
+                return original(*args, **kwargs)
             try:
                 if hooks._enabled:
                     hidden = kwargs.get("hidden_states")

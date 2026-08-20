@@ -24,13 +24,27 @@
 - 输入长度：**32K（32768 tokens）**
 - KV budget：**13446 tokens**（TriAttention 实测取值，即保留约 41% 的 KV）
 
-两个适配包都直接支持"绝对 budget"参数，把 13446 作为行级 KV 保留长度：
+### budget 语义说明（per-token vs per-layer）
 
-| 工具 | 参数 | 取值 |
-|---|---|---|
-| TriAttention（参考） | `TRIATTN_RUNTIME_KV_BUDGET` | `13446` |
-| kvpress-ascend | `KVPRESS_KV_BUDGET` | `13446` |
-| SqueezeAttention-ascend | `SQUEEZE_KV_BUDGET` | `13446`（uniform 模式共享 K） |
+**13446 是"每个 layer 每行保留的 token 数"**（行级 KV 长度），三个工具在该口径下
+的内存占用都是 `L × 13446`（L = 层数）：
+
+| 工具 | 参数 | 取值 | 语义 |
+|---|---|---|---|
+| TriAttention（参考） | `TRIATTN_RUNTIME_KV_BUDGET` | `13446` | 每层行保留 13446 token |
+| kvpress-ascend | `KVPRESS_KV_BUDGET` | `13446` | 每层行保留 13446 token（与 TriAttention 同口径） |
+| SqueezeAttention-ascend（方式 A） | `SQUEEZE_KV_BUDGET` | `13446` | uniform 模式共享 K=13446，内存精确对齐 |
+| SqueezeAttention-ascend（方式 B，推荐） | `SQUEEZE_INI_SIZE=0.21` + `SQUEEZE_CLASS3_SIZE=0.41` | K≈13434 | 由逐层机制决定运行点：class3（重要层）预算 = 0.41×32768 ≈ 13446，K = max(预算) 自动落在 13446 附近 |
+
+SqueezeAttention 的预算**本身就是 per-layer 的**（`sliding_windows[L]`），论文口径是
+总量守恒 `Σ_L budget_L = L × ini_size × prompt_len`。但 vLLM-Ascend 的块表行和
+`seq_lens` 跨层共享，物理行长度必须统一 → uniform 模式取 `K = max(budget_L)`：
+- 方式 A：`SQUEEZE_KV_BUDGET=13446` 直接固定 K，内存与 TriAttention/kvpress 完全一致
+  （per-layer 差异体现在 `[CLUSTER]` 预算日志中）；
+- 方式 B：不设绝对 budget，让 KMeans 决定 K —— 例：ini=0.21、class3=0.41、36 层
+  12/12/12 分类时，class1/2 预算 = 0.11×32768 ≈ 3604，class3 = 13434，
+  `K = max = 13434 ≈ 13446`，运行点与 TriAttention 一致，同时 `[CLUSTER]` 日志保留
+  了"哪些层需要更多预算"的逐层信息。
 
 对应的等价压缩比 ≈ `1 - 13446/32768 ≈ 0.59`。
 
@@ -75,9 +89,11 @@ export KVPRESS_PROBE=1                  # 每次推理打核心进入日志
 ```bash
 export SQUEEZE_ENABLE=1                 # 或 export SQUEEZE=1
 export SQUEEZE_MODE=uniform             # 正确模式（共享块表约束下的 K = max 预算）
-export SQUEEZE_KV_BUDGET=13446          # 与 TriAttention 实测口径一致
+# 二选一：
+#   方式 A（内存与 TriAttention 精确对齐）：export SQUEEZE_KV_BUDGET=13446
+#   方式 B（由逐层机制决定运行点，推荐）：
 export SQUEEZE_INI_SIZE=0.21            # 逐层初始预算占比（总预算守恒基准）
-export SQUEEZE_CLASS3_SIZE=0.41         # 高重要性层的保留占比 ≈ 13446/32768
+export SQUEEZE_CLASS3_SIZE=0.41         # 高重要性层保留占比 ≈ 13446/32768，K≈13434
 export SQUEEZE_START_SIZE=4             # StreamingLLM sink tokens
 export SQUEEZE_KMEANS_SEED=42           # 聚类可复现
 export SQUEEZE_RUNTIME_LOGGING=1
@@ -163,7 +179,35 @@ cd ../SqueezeAttention-ascend && python -m pytest tests/   # 19 项
 BlockTable / V1 调度器 / KV cache manager），在 CPU 上运行真实 patch 代码：
 插件激活、压缩内容正确性、块回收、输入覆盖、探针开关、MTP 多 group、两插件共存。
 
-## 7. 文档索引
+## 7. 故障排查
+
+### `ValueError: too many values to unpack (expected 24)`（启动 profile_run 阶段）
+
+报错出现在 `determine_available_memory -> profile_run -> _dummy_run` 的编译模型
+forward 内部（npugraph_ex / AOT 编译产物）。日志中如果出现
+`Loaded npugraph_ex compilation cache ... / Loaded AOT compilation from path ...`，
+说明命中了**旧的编译缓存**，缓存产物的输入/输出数量与当前图不一致时就会
+unpack 数量不匹配。按顺序排查：
+
+```bash
+# 1) 清掉编译缓存（最可能的原因），重跑
+rm -rf /root/.cache/vllm /root/.cache/torch
+
+# 2) 隔离验证：先关掉两个插件，确认报错是否与插件无关
+unset KVPRESS_ENABLE KVPRESS SQUEEZE_ENABLE SQUEEZE
+vllm serve <同上命令>
+
+# 3) 若只有开插件时才报错：我们的 attention hook 在编译期是完全透明的
+#    （torch.compiler.is_compiling() 时直接短路，且 hook 内不做任何张量运算），
+#    仍出现则提供完整日志（含 [KVPRESS-ASCEND]/[SQUEEZE-ASCEND] 启动行）反馈。
+```
+
+注意：SqueezeAttention 的逐层重要性捕获（hidd_data）需要 prefill 走 eager。
+若 prefill 被 npugraph_ex 编译（本配置下 profile 阶段即编译 1..4096 range），
+hook 在编译路径下不会捕获 → 预算退化为 uniform 初始预算（`SQUEEZE_KV_BUDGET`
+仍可固定 K）。需要逐层聚类生效时，可临时加 `--enforce-eager` 验证。
+
+## 8. 文档索引
 
 - `PLAN.md` — 完整设计（机制对照表、patch 面、参数表、限制）
 - `TODO.md` — 执行清单 + 上机首跑检查项
