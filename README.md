@@ -1,0 +1,172 @@
+# try_demo5 — KV-Cache 压缩工具 × vLLM-Ascend v0.23.0 一体化部署
+
+本仓库把三个 KV cache 压缩方案统一适配到 `vllm-ascend-releases-v0.23.0`
+（Qwen3.5-27B-w8a8-mtp 场景，TP=4，MTP 推测解码），**不修改任何 vLLM-Ascend 源码**：
+
+| 目录 | 说明 |
+|---|---|
+| `kvpress-ascend/` | kvpress 的 monkeypatch 适配包（pip 安装，`vllm.general_plugins` 插件） |
+| `SqueezeAttention-ascend/` | SqueezeAttention 的 monkeypatch 适配包（pip 安装，插件） |
+| `tri_3_5-fix-partial-rope-qwen35-v0.23.0/` | TriAttention 参考实现（vLLM-Ascend 0.23.0 已验证，机制转换的参照物） |
+| `kvpress-main/` | kvpress 原始工具源码 |
+| `SqueezeAttention-main/` | SqueezeAttention 原始工具源码 |
+| `vllm-ascend-releases-v0.23.0/` | 目标 vLLM-Ascend（只读参照，未被修改） |
+| `PLAN.md` / `TODO.md` | 完整设计文档 / 执行清单 |
+
+> 三者是**同一运行时可替换**的方案：一次只激活一个（`export KVPRESS_ENABLE=1`
+> 或 `export SQUEEZE_ENABLE=1`，TriAttention 用 `export ENABLE_TRIATTENTION=1`），
+> 但安装可以全部共存。
+
+---
+
+## 1. 参考运行点（实测口径）
+
+- 输入长度：**32K（32768 tokens）**
+- KV budget：**13446 tokens**（TriAttention 实测取值，即保留约 41% 的 KV）
+
+两个适配包都直接支持"绝对 budget"参数，把 13446 作为行级 KV 保留长度：
+
+| 工具 | 参数 | 取值 |
+|---|---|---|
+| TriAttention（参考） | `TRIATTN_RUNTIME_KV_BUDGET` | `13446` |
+| kvpress-ascend | `KVPRESS_KV_BUDGET` | `13446` |
+| SqueezeAttention-ascend | `SQUEEZE_KV_BUDGET` | `13446`（uniform 模式共享 K） |
+
+对应的等价压缩比 ≈ `1 - 13446/32768 ≈ 0.59`。
+
+---
+
+## 2. 一起 pip 安装
+
+```bash
+cd try_demo5
+
+# 安装 kvpress-ascend（插件入口：vllm.general_plugins -> register_kvpress_backend）
+pip install ./kvpress-ascend
+
+# 安装 SqueezeAttention-ascend（插件入口：vllm.general_plugins -> register_squeezeattention_backend）
+pip install ./SqueezeAttention-ascend
+
+# （可选）kvpress 原始库，供 KVPRESS_USE_INSTALLED=1 时复用其 press 类
+# pip install ./kvpress-main
+```
+
+安装后两个插件即注册到 vLLM；**开关默认关闭**，不设置环境变量时是纯 no-op，
+不影响普通 vllm serve。
+
+---
+
+## 3. 拉起 vLLM-Ascend
+
+### 3.1 方式 A：kvpress-ascend（推荐参数，32K / budget 13446）
+
+```bash
+export KVPRESS_ENABLE=1                 # 或 export KVPRESS=1
+export KVPRESS_PRESS=KnormPress         # 或 StreamingLLMPress / SnapKVPress / TOVAPress ...
+export KVPRESS_KV_BUDGET=13446          # 与 TriAttention 实测口径一致
+export KVPRESS_MIN_RECLAIM_BLOCKS=16    # 块大小 128 时约 2048 token 才压缩一次
+export KVPRESS_DEFER_PREFILL_COMPRESSION=1
+export KVPRESS_RUNTIME_LOGGING=1        # 实时有效性开关
+export KVPRESS_PROBE=1                  # 每次推理打核心进入日志
+```
+
+### 3.2 方式 B：SqueezeAttention-ascend（推荐参数，32K / budget 13446）
+
+```bash
+export SQUEEZE_ENABLE=1                 # 或 export SQUEEZE=1
+export SQUEEZE_MODE=uniform             # 正确模式（共享块表约束下的 K = max 预算）
+export SQUEEZE_KV_BUDGET=13446          # 与 TriAttention 实测口径一致
+export SQUEEZE_INI_SIZE=0.21            # 逐层初始预算占比（总预算守恒基准）
+export SQUEEZE_CLASS3_SIZE=0.41         # 高重要性层的保留占比 ≈ 13446/32768
+export SQUEEZE_START_SIZE=4             # StreamingLLM sink tokens
+export SQUEEZE_KMEANS_SEED=42           # 聚类可复现
+export SQUEEZE_RUNTIME_LOGGING=1
+export SQUEEZE_PROBE=1
+```
+
+### 3.3 vllm serve 命令（两种方式共用，与平时完全一致）
+
+```bash
+vllm serve /softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp \
+  --served-model-name "qwen3.5" \
+  --host 0.0.0.0 \
+  --port 1144 \
+  --data-parallel-size 1 \
+  --tensor-parallel-size 4 \
+  --max-model-len 262144 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 128 \
+  --gpu-memory-utilization 0.9 \
+  --compilation-config '{"cudagraph_capture_sizes":[1,4,8,12,16,24,32,48,56,64,72,84,96,108,112,128,160,172,196,200,212,232,272,288,312,328,344,360,384,400,416,432,448,480,512], "cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --speculative_config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 3, "enforce_eager": true}' \
+  --trust-remote-code \
+  --async-scheduling \
+  --allowed-local-media-path / \
+  --quantization ascend \
+  --no-enable-prefix-caching \
+  --mm-processor-cache-gb 0 \
+  --additional-config '{"enable_cpu_binding":true}' \
+  --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
+```
+
+---
+
+## 4. 实时有效性验证（每次推理的核心进入日志）
+
+### kvpress-ascend 每步探针
+
+```
+[KVPRESS-ASCEND][PROBE] step=42 req=req-1 core_entered=1 hook_entered=1
+  press=KnormPress ratio=0.590 seq_len=32768 budget=13446 keep=13446
+  reclaimed_blocks=32 compress_events=1 last_event=applied
+```
+
+- `core_entered=1`：runner proxy 拦截生效（压缩边界流程活着）
+- `hook_entered=1`：attention hook 本步捕获到 query（评分输入活着）
+- 两者同时为 0 ⇒ patch 未生效，检查 `KVPRESS_ENABLE` 与启动日志
+
+### SqueezeAttention-ascend 每步探针
+
+```
+[SQUEEZE-ASCEND][PROBE] step=42 req=req-1 core_entered=1 hook_entered=1
+  mode=uniform layers=36 budgets_ready=1 K=13446 start=4 ini=0.210 class3=0.410
+  seq_len=13446 keep=13446 reclaimed_blocks=32 compress_events=1 last_event=applied
+[SQUEEZE-ASCEND][CLUSTER] budgets req=req-1 layers=36 prompt_len=32768 ...
+  class_sizes={0:12,1:12,2:12} budgets=[...]
+```
+
+---
+
+## 5. 机制转换要点（一句话版）
+
+- **kvpress**：HF `DynamicCache` 稠密 KV ↔ Ascend 分块缓存（`gather_request_kv_dense` +
+  按 head 原地压缩到行前缀）；`self_attn` hook ↔ vLLM 解码层 attention hook（捕获
+  post-RoPE query）；`cache_position` 重映射 ↔ 调度器有效长度跟踪 + `_prepare_inputs`
+  覆盖（seq_lens / positions / slot mapping）；块行收缩 + 调度器侧块回收。
+- **SqueezeAttention**：`hiddlayer` 余弦相似度 ↔ 解码层 hook 捕获；KMeans 3 类逐层
+  预算（总预算守恒）↔ `core/budgets.py`；逐层 streaming 丢弃 ↔ 逐层 recency keep
+  set 的块级压缩。
+- **已知约束**：vLLM-Ascend 块表/seq_len 跨层共享，逐层不同 token 数的预算无法物理
+  表达 → `SQUEEZE_MODE=uniform` 用共享 K=max(预算)；`class_weighted` 为实验模式
+  （fake-key 填充）。kvpress 的 mask 类 press（AdaKV 等）在 Ascend kernel 上不可
+  物理实现，启动时明确拒绝并报错。
+
+## 6. 测试（本机无 NPU，模拟调试）
+
+```bash
+pip install pytest scikit-learn
+cd kvpress-ascend && python -m pytest tests/        # 31 项
+cd ../SqueezeAttention-ascend && python -m pytest tests/   # 19 项
+```
+
+测试用 stub 镜像 vllm-ascend v0.23.0 的接口（NPUWorker / NPUModelRunner /
+BlockTable / V1 调度器 / KV cache manager），在 CPU 上运行真实 patch 代码：
+插件激活、压缩内容正确性、块回收、输入覆盖、探针开关、MTP 多 group、两插件共存。
+
+## 7. 文档索引
+
+- `PLAN.md` — 完整设计（机制对照表、patch 面、参数表、限制）
+- `TODO.md` — 执行清单 + 上机首跑检查项
+- `kvpress-ascend/README.md`、`SqueezeAttention-ascend/README.md` — 各自完整参数表
+- `tri_3_5-fix-partial-rope-qwen35-v0.23.0/docs/vllm_ascend.md` — TriAttention 的
+  vLLM-Ascend 集成说明（机制转换参照物）

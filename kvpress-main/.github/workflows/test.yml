@@ -1,0 +1,33 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+
+jobs:
+  test:
+    runs-on: linux-amd64-gpu-l4-latest-1
+    steps:
+      - uses: actions/checkout@v3
+      - name: Verify environment
+        run: |
+          nvidia-smi
+          python3 --version
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          uv sync --all-groups
+          # Needed for CI/CD testing: flash-attn prebuilt wheels are tied to exact torch/CUDA builds.
+          uv pip install "torch==2.11.0+cu130" --torch-backend cu130
+      - run: make test
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Keep in sync with the torch/CUDA pin above.
+          FLASH_ATTN_PACKAGE: "flash-attn==2.8.3+cu130torch2.11"
+          FLASH_ATTN_INSTALL_ARGS: "--only-binary flash-attn"

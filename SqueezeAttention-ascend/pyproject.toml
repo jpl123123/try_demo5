@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "SqueezeAttention-ascend"
+version = "0.1.0"
+description = "SqueezeAttention monkeypatch adapter for vLLM-Ascend v0.23.0"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+sklearn = ["scikit-learn>=1.0"]
+
+[project.entry-points."vllm.general_plugins"]
+squeezeattention_ascend = "squeezeattention_ascend.plugin:register_squeezeattention_backend"
+
+[tool.setuptools.packages.find]
+include = ["squeezeattention_ascend*"]
