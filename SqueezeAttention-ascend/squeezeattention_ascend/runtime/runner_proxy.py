@@ -35,6 +35,7 @@ from .compression_engine import (
 from .thresholds import (
     compression_length_threshold,
     is_prefill_phase_for_limit,
+    is_request_scheduled_as_prefill,
     resolve_request_prefill_len,
 )
 from .output_bridge import attach_events_to_output
@@ -47,16 +48,10 @@ from .state import RequestStateStore
 
 
 def _scheduled_items(scheduler_output: Any) -> list[tuple[str, int]]:
-    scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
-    if not isinstance(scheduled, dict):
-        return []
-    items = []
-    for req_id, num in scheduled.items():
-        try:
-            items.append((str(req_id), max(1, int(num))))
-        except (TypeError, ValueError):
-            continue
-    return items
+    """Normalized scheduled items (vLLM keys may be request objects)."""
+    from .request_key_compat import iter_scheduled_token_items
+
+    return list(iter_scheduled_token_items(scheduler_output))
 
 
 def _resolve_prefill_len(request: Any) -> int:
@@ -345,7 +340,15 @@ class SqueezeAttentionModelRunner:
             if state is None or state.extra.get("budgets_ready"):
                 continue
             prefill_len = int(state.prefill_len or 0)
-            if prefill_len <= 0 or int(state.num_computed_tokens) < prefill_len:
+            if prefill_len <= 0:
+                continue
+            scheduler_says_prefill_done = not is_request_scheduled_as_prefill(
+                scheduler_output, req_id
+            )
+            if (
+                int(state.num_computed_tokens) < prefill_len
+                and not scheduler_says_prefill_done
+            ):
                 continue
             accumulator = state.extra.get("importance")
             num_layers = self.hooks.layer_count

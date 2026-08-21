@@ -4,11 +4,12 @@ Mirrors the TriAttention scheduling philosophy (tri_3_5 thresholds.py +
 prefill_phase.py):
 
 - the trigger threshold is ``budget + max(min_reclaim_blocks * block_size)``;
-- prefill-phase detection uses LOGICAL scheduler progress (the request being
-  in ``scheduled_new_reqs``, or ``num_scheduled_tokens > 1`` for chunked
-  prefill), NOT the compressed effective KV length — effective length stays
-  small by design after compaction, so using it would stick decode steps
-  behind prefill-only gates;
+- prefill-phase detection uses LOGICAL scheduler progress: the request being
+  in ``scheduled_new_reqs`` (vLLM keeps chunked-prefill requests there across
+  chunks), or ``num_scheduled_tokens > 1`` **excluding MTP spec-decode steps**
+  (MTP decode schedules the draft tokens, so scheduled_tokens > 1 must NOT be
+  classified as prefill — this is the exact trap that kept the worker from
+  ever compressing under ``qwen3_5_mtp``);
 - the worker self-triggers from the ACTUAL block-table capacity, so the
   pipeline compresses even when engine-core scheduler signals are absent or
   lag behind.
@@ -18,18 +19,21 @@ from __future__ import annotations
 
 from typing import Any
 
+from .request_key_compat import is_request_scheduled_as_spec_decode
+
 
 def is_request_scheduled_as_prefill(scheduler_output: Any, req_id: str) -> bool:
     """The request is still in ``scheduled_new_reqs`` (vLLM's most reliable
-    in-prefill signal; chunked prefill keeps a request there across chunks)."""
-    scheduled_new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
-    if not isinstance(scheduled_new_reqs, (list, tuple)):
-        return False
-    for new_req in scheduled_new_reqs:
-        candidate = getattr(new_req, "req_id", None)
-        if candidate is None:
-            candidate = getattr(new_req, "request_id", None)
-        if candidate == req_id:
+    in-prefill signal; chunked prefill keeps a request there across chunks).
+
+    Parses both real vLLM ``NewScheduledRequest`` namedtuples and plain
+    ``(None, request)`` tuples via the shared compat parser."""
+    from .request_key_compat import iter_scheduled_new_requests
+
+    for candidate, _request, _num_prompt in iter_scheduled_new_requests(
+        scheduler_output
+    ):
+        if str(candidate) == str(req_id):
             return True
     return False
 
@@ -42,11 +46,23 @@ def is_prefill_phase_for_limit(
     prefill_len: int,
     num_computed_tokens: Any,
 ) -> bool:
-    """Classify prefill for prefill-only policy gates (logical progress)."""
+    """Classify prefill for prefill-only policy gates.
+
+    Worker-side callers pass the mirrored/derived num_computed, which after
+    compression intentionally stays below the prompt length — so the
+    num_computed fallback is only consulted when the request is NOT in
+    scheduled_new_reqs, the step is NOT MTP spec-decode, and scheduled_tokens
+    is exactly 1 (plain decode with a known prompt length).
+    """
     if is_request_scheduled_as_prefill(scheduler_output, str(req_id)):
         return True
-    if int(scheduled_tokens) > 1:
+    is_spec_decode_step = is_request_scheduled_as_spec_decode(
+        scheduler_output, str(req_id)
+    )
+    if int(scheduled_tokens) > 1 and not is_spec_decode_step:
         return True
+    if int(scheduled_tokens) != 1 or is_spec_decode_step:
+        return False
     if int(prefill_len) <= 0 or num_computed_tokens is None:
         return False
     try:

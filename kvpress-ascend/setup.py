@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="kvpress-ascend",
-    version = "0.3.0",
+    version = "0.3.1",
     description=(
         "kvpress monkeypatch adapter for vLLM-Ascend v0.23.0: converts the kvpress "
         "KV-cache compression mechanism to vLLM-Ascend block-cache compaction "

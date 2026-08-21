@@ -97,12 +97,13 @@ class StubScheduler:
                 rid: int(tokens.get(rid, 1)) for rid in self.requests
             }
         )
+        # Real vLLM keeps chunked-prefill requests in scheduled_new_reqs until
+        # their prefill completes.
         new_reqs = [
             (None, req)
             for rid, req in self.requests.items()
-            if rid not in self._sim_seen
+            if req.num_computed_tokens < req.num_prompt_tokens
         ]
-        self._sim_seen.update(rid for rid in self.requests)
         out.scheduled_new_reqs = new_reqs
         out.finished_req_ids = list(self.finished_req_ids)
         self.finished_req_ids = []

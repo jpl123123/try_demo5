@@ -253,9 +253,16 @@ BlockTable / V1 调度器 / KV cache manager），在 CPU 上运行真实 patch 
    uniform `SQUEEZE_INI_SIZE`。
 5. 调度器新增心跳日志（每 500 步一行 `scheduler heartbeat step=... signals=...
    tracker_entries=...`），从 engine-core 日志即可确认调度器 patch 是否活着。
+6. **MTP 推测解码误判修复（v0.3.1 关键）**：`qwen3_5_mtp` 解码时每个请求的
+   `num_scheduled_tokens` 是 1 个目标 token + 3 个 draft token（=4），旧的
+   "`scheduled_tokens > 1` 视为 prefill"门控会把**每一步解码都误判成 prefill**，
+   导致永远跳过压缩（`seq_len=0` 无驱逐的元凶）。现在按 TriAttention 的做法
+   排除 spec-decode 步骤（`scheduled_spec_decode_tokens` 非空即不算 prefill）。
+   另外 `num_scheduled_tokens` 的 key 可能是 request 对象而非字符串，已统一
+   归一化为 req_id（TriAttention 的 `req_id_from_scheduled_key` 同款）。
 
-**务必重新安装**：`pip install ./kvpress-ascend`（v0.3.0）+
-`pip install ./SqueezeAttention-ascend`（v0.2.0）。升级后验证：
+**务必重新安装**：`pip install ./kvpress-ascend`（v0.3.1）+
+`pip install ./SqueezeAttention-ascend`（v0.2.1）。升级后验证：
 `[PROBE]` 应出现 `seq_len>0`，并出现 `COMPRESS` / `[CLUSTER]` 事件行；
 即使探针里 `layers=0`，只要出现 `COMPRESS ... reclaimed_blocks=...` 即压缩生效。
 

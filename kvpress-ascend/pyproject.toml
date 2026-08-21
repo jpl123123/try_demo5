@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvpress-ascend"
-version = "0.3.0"
+version = "0.3.1"
 description = "kvpress monkeypatch adapter for vLLM-Ascend v0.23.0"
 requires-python = ">=3.8"
 dependencies = [

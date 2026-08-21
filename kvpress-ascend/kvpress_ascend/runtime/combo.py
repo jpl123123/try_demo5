@@ -51,6 +51,7 @@ from .state import RequestStateStore
 from .thresholds import (
     compression_length_threshold,
     is_prefill_phase_for_limit,
+    is_request_scheduled_as_prefill,
     resolve_request_prefill_len,
 )
 
@@ -514,16 +515,26 @@ class KVPressSqueezeComboRunner:
 
     def _sync_worker_num_computed(self, scheduler_output: Any) -> None:
         requests_dict = getattr(self._base_runner, "requests", None)
-        if not isinstance(requests_dict, dict):
-            return
+        input_batch = getattr(self._base_runner, "input_batch", None)
+        req_id_to_index = (
+            getattr(input_batch, "req_id_to_index", None) if input_batch else None
+        )
+        num_computed_cpu = getattr(input_batch, "num_computed_tokens_cpu", None) if input_batch else None
         for req_id, _scheduled in iter_scheduled_token_items(scheduler_output):
             state = self.state_store.get(req_id)
             if state is None:
                 continue
-            req_state = requests_dict.get(req_id)
-            if req_state is None:
-                continue
-            nct = int(getattr(req_state, "num_computed_tokens", 0) or 0)
+            nct = 0
+            req_state = requests_dict.get(req_id) if isinstance(requests_dict, dict) else None
+            if req_state is not None:
+                nct = int(getattr(req_state, "num_computed_tokens", 0) or 0)
+            if nct <= 0 and isinstance(req_id_to_index, dict) and num_computed_cpu is not None:
+                req_index = req_id_to_index.get(req_id)
+                if isinstance(req_index, int):
+                    try:
+                        nct = int(num_computed_cpu[req_index])
+                    except Exception:
+                        pass
             if nct > int(state.num_computed_tokens):
                 state.num_computed_tokens = nct
 
@@ -584,7 +595,15 @@ class KVPressSqueezeComboRunner:
             if state is None or state.extra.get("budgets_ready"):
                 continue
             prefill_len = int(state.prefill_len or 0)
-            if prefill_len <= 0 or int(state.num_computed_tokens) < prefill_len:
+            if prefill_len <= 0:
+                continue
+            scheduler_says_prefill_done = not is_request_scheduled_as_prefill(
+                scheduler_output, req_id
+            )
+            if (
+                int(state.num_computed_tokens) < prefill_len
+                and not scheduler_says_prefill_done
+            ):
                 continue
             accumulator = state.extra.get("importance")
             num_layers = self.hooks.layer_count or 1

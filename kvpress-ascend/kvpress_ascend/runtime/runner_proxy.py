@@ -51,16 +51,10 @@ from .state import RequestStateStore
 
 
 def _scheduled_items(scheduler_output: Any) -> list[tuple[str, int]]:
-    scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
-    if not isinstance(scheduled, dict):
-        return []
-    items = []
-    for req_id, num in scheduled.items():
-        try:
-            items.append((str(req_id), max(1, int(num))))
-        except (TypeError, ValueError):
-            continue
-    return items
+    """Normalized scheduled items (vLLM keys may be request objects)."""
+    from .request_key_compat import iter_scheduled_token_items
+
+    return list(iter_scheduled_token_items(scheduler_output))
 
 
 def _resolve_prefill_len(request: Any) -> int:
@@ -207,16 +201,26 @@ class KVPressModelRunner:
     def _sync_worker_num_computed(self, scheduler_output: Any) -> None:
         """Mirror vLLM's num_computed_tokens into request state each step."""
         requests_dict = getattr(self._base_runner, "requests", None)
-        if not isinstance(requests_dict, dict):
-            return
+        input_batch = getattr(self._base_runner, "input_batch", None)
+        req_id_to_index = (
+            getattr(input_batch, "req_id_to_index", None) if input_batch else None
+        )
+        num_computed_cpu = getattr(input_batch, "num_computed_tokens_cpu", None) if input_batch else None
         for req_id, _scheduled in _scheduled_items(scheduler_output):
             state = self.state_store.get(req_id)
             if state is None:
                 continue
-            req_state = requests_dict.get(req_id)
-            if req_state is None:
-                continue
-            nct = int(getattr(req_state, "num_computed_tokens", 0) or 0)
+            nct = 0
+            req_state = requests_dict.get(req_id) if isinstance(requests_dict, dict) else None
+            if req_state is not None:
+                nct = int(getattr(req_state, "num_computed_tokens", 0) or 0)
+            if nct <= 0 and isinstance(req_id_to_index, dict) and num_computed_cpu is not None:
+                req_index = req_id_to_index.get(req_id)
+                if isinstance(req_index, int):
+                    try:
+                        nct = int(num_computed_cpu[req_index])
+                    except Exception:
+                        pass
             if nct > int(state.num_computed_tokens):
                 state.num_computed_tokens = nct
 
