@@ -84,16 +84,26 @@ pip install ./SqueezeAttention-ascend
   （不会出现双重 proxy / 双重压缩 / 重复释放）。
 
 ```bash
+# ---- 先升级到 v0.2.0（修复了 layers=0 / seq_len=0 / 无驱逐 的问题）----
+pip install ./kvpress-ascend
+pip install ./SqueezeAttention-ascend
+
+# ---- 组合模式（两个工具都启用，KVPRESS_COMBO=1 是开关）----
 export KVPRESS_ENABLE=1
 export SQUEEZE_ENABLE=1
-export KVPRESS_COMBO=1                # 组合模式开关（推荐同时开两者时使用）
+export KVPRESS_COMBO=1                # 组合模式（SqueezeAttention 插件自动跳过独立安装）
 export KVPRESS_PRESS=KnormPress       # token 维度：kvpress press
-export KVPRESS_KV_BUDGET=13446        # 或让 KMeans 决定（见 3.2 方式 B）
-export SQUEEZE_INI_SIZE=0.21          # layer 维度：逐层预算基准
-export SQUEEZE_CLASS3_SIZE=0.41
-export SQUEEZE_START_SIZE=4
+export KVPRESS_KV_BUDGET=13446        # 每层行保留 13446 token（与 TriAttention 同口径）
+export KVPRESS_MIN_RECLAIM_BLOCKS=16  # 块大小 128 时约 2048 token 才压缩一次
+export KVPRESS_DEFER_PREFILL_COMPRESSION=1
 export KVPRESS_RUNTIME_LOGGING=1
-export KVPRESS_PROBE=1
+export KVPRESS_PROBE=1                # combo 探针走 KVPRESS 日志通道
+export SQUEEZE_INI_SIZE=0.21          # layer 维度：逐层预算基准（总预算守恒）
+export SQUEEZE_CLASS3_SIZE=0.41       # 高重要性层保留占比 ≈ 13446/32768
+export SQUEEZE_START_SIZE=4
+export SQUEEZE_KMEANS_SEED=42
+# （组合模式下 SQUEEZE_KV_BUDGET / SQUEEZE_PROBE / SQUEEZE_RUNTIME_LOGGING
+#   不再生效：K 由 KVPRESS_KV_BUDGET 决定，探针走 KVPRESS_PROBE）
 ```
 
 组合模式探针（每步每请求一行，两个维度都在）：
@@ -103,7 +113,7 @@ export KVPRESS_PROBE=1
   mode=combo layers=36 budgets_ready=1 K=13446 start=4 press=KnormPress
   ini=0.210 class3=0.410 seq_len=13446 keep=13446
   reclaimed_blocks=32 compress_events=1 last_event=applied
-[SQUEEZE-ASCEND][CLUSTER] combo budgets req=req-1 ... class_sizes={0:12,1:12,2:12}
+[KVPRESS-ASCEND][CLUSTER] combo budgets req=req-1 ... class_sizes={0:12,1:12,2:12}
 ```
 
 注意：combo 模式下 SqueezeAttention 插件会自动跳过独立安装（日志会打印
