@@ -79,16 +79,14 @@ def _patched_scheduler_schedule(self):
         block_size = 128
 
     # Record prefill lengths from newly scheduled requests (best effort).
-    new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
+    from .request_key_compat import iter_scheduled_new_requests
+
     prefill_lens = getattr(self, "squeeze_prefill_lens", None)
-    if isinstance(new_reqs, (list, tuple)) and isinstance(prefill_lens, dict):
-        for item in new_reqs:
-            request = item if not isinstance(item, tuple) else item[-1]
-            req_id = getattr(request, "req_id", None)
-            if req_id is None:
-                continue
-            num_prompt = getattr(request, "num_prompt_tokens", None)
-            if num_prompt is not None:
+    if isinstance(prefill_lens, dict):
+        for req_id, _request, num_prompt in iter_scheduled_new_requests(
+            scheduler_output
+        ):
+            if num_prompt > 0:
                 prefill_lens[str(req_id)] = int(num_prompt)
 
     # Scheduler-side candidate budget. Per-request budgets are learned

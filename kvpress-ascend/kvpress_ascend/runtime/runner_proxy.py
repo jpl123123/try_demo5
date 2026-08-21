@@ -35,6 +35,10 @@ from .compression_engine import (
     compress_request,
 )
 from .output_bridge import attach_events_to_output
+from .request_key_compat import (
+    iter_scheduled_new_requests,
+    iter_scheduled_token_items,
+)
 from .signals import CompressionSignal, signals_from_scheduler_output
 from .state import RequestStateStore
 
@@ -128,15 +132,10 @@ class KVPressModelRunner:
     # ------------------------------------------------------------ pre-step
 
     def _register_new_requests(self, scheduler_output: Any) -> None:
-        new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
-        if not isinstance(new_reqs, (list, tuple)):
-            return
-        for item in new_reqs:
-            request = item if not isinstance(item, tuple) else item[-1]
-            req_id = getattr(request, "req_id", None)
-            if req_id is None:
-                continue
-            prefill_len = _resolve_prefill_len(request)
+        for req_id, request, num_prompt_tokens in iter_scheduled_new_requests(
+            scheduler_output
+        ):
+            prefill_len = _resolve_prefill_len(request) or int(num_prompt_tokens)
             state = self.state_store.ensure(
                 str(req_id),
                 prefill_len=prefill_len,
@@ -178,9 +177,17 @@ class KVPressModelRunner:
             if req_id in signals:
                 continue
             state = self.state_store.get(req_id)
-            if state is None or not state.is_compressed:
+            if state is None:
                 continue
-            effective = int(state.current_cache_len)
+            if state.is_compressed:
+                effective = int(state.current_cache_len)
+            else:
+                # First-compression fallback: trigger from the worker-side
+                # mirrored num_computed_tokens (covers engine-core signal lag
+                # or an unpatched engine-core scheduler).
+                if int(state.num_computed_tokens) <= 0:
+                    continue
+                effective = int(state.num_computed_tokens)
             if effective + scheduled_tokens <= threshold:
                 continue
             signals[req_id] = CompressionSignal(

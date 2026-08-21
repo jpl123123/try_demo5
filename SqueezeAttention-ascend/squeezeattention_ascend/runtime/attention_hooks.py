@@ -22,6 +22,95 @@ import torch.nn.functional as F
 from ..logging_control import log_debug, log_warning
 
 
+
+def _resolve_model_layers(model: Any) -> list[Any]:
+    """Locate the decoder-layer container robustly (Qwen3.5 nests the stack
+    at ``language_model.model.layers``; Qwen3Next at ``model.model.layers``;
+    Llama at ``model.layers``). Bounded BFS fallback skips draft/spec modules
+    and only accepts containers whose members look like decoder layers."""
+    roots: list[Any] = []
+    for root in (
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+        getattr(model, "decoder", None),
+        getattr(model, "transformer", None),
+    ):
+        if root is not None and root not in roots:
+            roots.append(root)
+
+    def _container_layers(node: Any) -> Optional[list[Any]]:
+        for attr_name in ("layers", "h", "blocks"):
+            candidate = getattr(node, attr_name, None)
+            if isinstance(candidate, (list, tuple)) and candidate:
+                return list(candidate)
+            try:
+                candidate_list = [candidate[idx] for idx in range(len(candidate))]
+                if candidate_list:
+                    return candidate_list
+            except Exception:
+                continue
+        return None
+
+    def _looks_like_decoder(layers: list[Any]) -> bool:
+        for layer in layers[:4]:
+            if getattr(layer, "self_attn", None) is not None or getattr(
+                layer, "attention", None
+            ) is not None:
+                return True
+        return False
+
+    def _skip_module(module: Any) -> bool:
+        name = (
+            f"{getattr(type(module), '__module__', '')} "
+            f"{getattr(type(module), '__name__', '')}"
+        ).lower()
+        return any(marker in name for marker in ("draft", "mtp", "spec"))
+
+    for root in roots:
+        layers = _container_layers(root)
+        if layers and _looks_like_decoder(layers):
+            return layers
+        for attr in ("model", "language_model", "decoder", "transformer"):
+            nested = getattr(root, attr, None)
+            if nested is None:
+                continue
+            layers = _container_layers(nested)
+            if layers and _looks_like_decoder(layers):
+                return layers
+            for attr2 in ("model", "language_model"):
+                deeper = getattr(nested, attr2, None)
+                if deeper is None:
+                    continue
+                layers = _container_layers(deeper)
+                if layers and _looks_like_decoder(layers):
+                    return layers
+
+    seen: set[int] = set()
+    queue: list[Any] = list(roots)
+    for _depth in range(8):
+        next_queue: list[Any] = []
+        for node in queue:
+            if node is None or id(node) in seen:
+                continue
+            seen.add(id(node))
+            if _skip_module(node):
+                continue
+            layers = _container_layers(node)
+            if layers and _looks_like_decoder(layers):
+                return layers
+            try:
+                for child in node.children():
+                    if id(child) not in seen:
+                        next_queue.append(child)
+            except Exception:
+                continue
+        queue = next_queue
+        if not queue:
+            break
+    return []
+
+
 def _first_tensor_like(value: Any) -> Optional[torch.Tensor]:
     if isinstance(value, (list, tuple)):
         for item in value:
@@ -180,31 +269,7 @@ class SqueezeAttentionHooks:
         self._hooks.append(attn_module)
 
     def install(self, model: Any) -> int:
-        roots = [
-            model,
-            getattr(model, "model", None),
-            getattr(model, "decoder", None),
-            getattr(model, "transformer", None),
-            getattr(model, "language_model", None),
-        ]
-        layers: list[Any] = []
-        for root in roots:
-            if root is None:
-                continue
-            for attr_name in ("layers", "h", "blocks"):
-                candidate = getattr(root, attr_name, None)
-                if isinstance(candidate, (list, tuple)):
-                    layers = list(candidate)
-                    break
-                try:
-                    candidate_list = [candidate[idx] for idx in range(len(candidate))]
-                    if candidate_list:
-                        layers = candidate_list
-                        break
-                except Exception:
-                    continue
-            if layers:
-                break
+        layers: list[Any] = _resolve_model_layers(model)
 
         hooked = 0
         for local_idx, layer in enumerate(layers):

@@ -72,6 +72,43 @@ pip install ./SqueezeAttention-ascend
 
 ## 3. 拉起 vLLM-Ascend
 
+### 3.0 Combo 模式（两个工具叠加，推荐 —— 只驱逐一次）
+
+同时启用 kvpress 与 SqueezeAttention 时，**组合模式**把它们叠成一条流水线，
+每个压缩边界只做**一次物理驱逐**：
+
+- **layer 维度**：SqueezeAttention 的逐层重要性（hidd_data）→ KMeans 逐层预算
+  （哪些层重要、该留多少）；
+- **token 维度**：kvpress press 逐层打分（每个 layer 留**哪些** token）；
+- **一次驱逐**：每个压缩边界 = 一次逐层原地压缩 + 一次块行收缩 + 一次调度器回收事件
+  （不会出现双重 proxy / 双重压缩 / 重复释放）。
+
+```bash
+export KVPRESS_ENABLE=1
+export SQUEEZE_ENABLE=1
+export KVPRESS_COMBO=1                # 组合模式开关（推荐同时开两者时使用）
+export KVPRESS_PRESS=KnormPress       # token 维度：kvpress press
+export KVPRESS_KV_BUDGET=13446        # 或让 KMeans 决定（见 3.2 方式 B）
+export SQUEEZE_INI_SIZE=0.21          # layer 维度：逐层预算基准
+export SQUEEZE_CLASS3_SIZE=0.41
+export SQUEEZE_START_SIZE=4
+export KVPRESS_RUNTIME_LOGGING=1
+export KVPRESS_PROBE=1
+```
+
+组合模式探针（每步每请求一行，两个维度都在）：
+
+```
+[KVPRESS-ASCEND][PROBE] step=42 req=req-1 core_entered=1 hook_entered=1
+  mode=combo layers=36 budgets_ready=1 K=13446 start=4 press=KnormPress
+  ini=0.210 class3=0.410 seq_len=13446 keep=13446
+  reclaimed_blocks=32 compress_events=1 last_event=applied
+[SQUEEZE-ASCEND][CLUSTER] combo budgets req=req-1 ... class_sizes={0:12,1:12,2:12}
+```
+
+注意：combo 模式下 SqueezeAttention 插件会自动跳过独立安装（日志会打印
+`combo mode active ... standalone install skipped`），确保只有一条调度/压缩链路。
+
 ### 3.1 方式 A：kvpress-ascend（推荐参数，32K / budget 13446）
 
 ```bash
@@ -162,6 +199,9 @@ vllm serve /softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp \
 - **SqueezeAttention**：`hiddlayer` 余弦相似度 ↔ 解码层 hook 捕获；KMeans 3 类逐层
   预算（总预算守恒）↔ `core/budgets.py`；逐层 streaming 丢弃 ↔ 逐层 recency keep
   set 的块级压缩。
+- **组合模式（KVPRESS_COMBO=1）**：layer 维度预算（SqueezeAttention KMeans）×
+  token 维度选择（kvpress press）叠成一条流水线，每个压缩边界只做**一次**物理驱逐
+  （一次逐层压缩 + 一次行收缩 + 一次回收），避免双插件时的双重驱逐/重复释放。
 - **已知约束**：vLLM-Ascend 块表/seq_len 跨层共享，逐层不同 token 数的预算无法物理
   表达 → `SQUEEZE_MODE=uniform` 用共享 K=max(预算)；`class_weighted` 为实验模式
   （fake-key 填充）。kvpress 的 mask 类 press（AdaKV 等）在 Ascend kernel 上不可
@@ -171,8 +211,8 @@ vllm serve /softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp \
 
 ```bash
 pip install pytest scikit-learn
-cd kvpress-ascend && python -m pytest tests/        # 31 项
-cd ../SqueezeAttention-ascend && python -m pytest tests/   # 19 项
+cd kvpress-ascend && python -m pytest tests/        # 38 项（含 combo、namedtuple 注册、编译透明）
+cd ../SqueezeAttention-ascend && python -m pytest tests/   # 21 项
 ```
 
 测试用 stub 镜像 vllm-ascend v0.23.0 的接口（NPUWorker / NPUModelRunner /
@@ -180,6 +220,23 @@ BlockTable / V1 调度器 / KV cache manager），在 CPU 上运行真实 patch 
 插件激活、压缩内容正确性、块回收、输入覆盖、探针开关、MTP 多 group、两插件共存。
 
 ## 7. 故障排查
+
+### 探针全 0（`layers=0 hook_entered=0 seq_len=0 keep=0`，无驱逐）
+
+日志里 `[PROBE]` 全 0 说明两个问题（v0.2.0 已修复，重新 `pip install` 两个包）：
+
+1. `layers=0`：hook 没找到解码层 —— Qwen3.5 的层在 `language_model.model.layers`
+   （Qwen3Next 在 `model.model.layers`），旧版只查了一层。新版用递归解析器定位
+   层容器（跳过 draft/MTP 模块），并只接受"成员带 self_attn/attention"的容器。
+2. `seq_len=0` + 无驱逐：请求没有注册成功 —— 真实 vLLM 的 `scheduled_new_reqs`
+   是 `NewScheduledRequest` namedtuple（字段 `req_id, request, num_computed_tokens,
+   num_prompt_tokens, num_scheduled_tokens`），旧版 `item[-1]` 取到的是数字。
+   新版按字段名解析两种形态。另外新增了**首次压缩 worker 自触发**兜底：即使
+   engine-core 的调度器信号缺失/滞后，worker 侧也能按自身 `num_computed_tokens`
+   触发第一次压缩。
+
+升级后验证：`[PROBE]` 应出现 `layers=36 ... budgets_ready=1 ... seq_len>0`，
+且出现 `COMPRESS` / `[CLUSTER]` 事件行。
 
 ### `ValueError: too many values to unpack (expected 24)`（启动 profile_run 阶段）
 

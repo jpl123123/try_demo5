@@ -76,6 +76,7 @@ def reset_patch_state() -> None:
     _capture_originals()
     restore_stub_classes()
     for name in (
+        "kvpress_ascend.runtime.combo",
         "kvpress_ascend.runtime.monkeypatch",
         "kvpress_ascend.runtime.worker_hooks",
         "kvpress_ascend.runtime.input_patch_v1",

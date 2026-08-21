@@ -23,6 +23,12 @@ def register_squeezeattention_backend() -> None:
     if not (env_bool("SQUEEZE_ENABLE", False) or env_bool("SQUEEZE", False)):
         log_info("disabled (set SQUEEZE_ENABLE=1 to activate)")
         return
+    if env_bool("KVPRESS_COMBO", False) or env_bool("KVPRESS_COMBO_ACTIVE", False):
+        log_info(
+            "combo mode active (KVPRESS_COMBO=1): SqueezeAttention standalone "
+            "install skipped; layer budgets are provided by the combo runner."
+        )
+        return
     try:
         from .runtime.monkeypatch import install_squeezeattention_integration_monkeypatches
 

@@ -24,6 +24,20 @@ def register_kvpress_backend() -> None:
         log_info("disabled (set KVPRESS_ENABLE=1 to activate)")
         return
     try:
+        if env_bool("KVPRESS_COMBO", False):
+            # Combo mode: SqueezeAttention layer budgets x kvpress press,
+            # ONE eviction per boundary (single scheduler patch + single
+            # combo runner proxy). The SqueezeAttention plugin skips its
+            # standalone install when combo is active.
+            from .runtime.combo import install_combo_monkeypatches
+
+            install_combo_monkeypatches()
+            log_info(
+                "plugin activated: KVPRESS_ENABLE=1 COMBO=1 press=%s build=%s",
+                os.environ.get("KVPRESS_PRESS", "KnormPress"),
+                "kvpress-ascend-v1-20260820",
+            )
+            return
         from .runtime.monkeypatch import install_kvpress_integration_monkeypatches
 
         install_kvpress_integration_monkeypatches(

@@ -93,6 +93,11 @@ class KVPressRuntimeConfig:
     # Press source
     use_installed_kvpress: bool = True
 
+    # Combo mode: compose SqueezeAttention layer-wise budgets with the kvpress
+    # press token-wise selection into ONE physical eviction per boundary
+    # (requires SqueezeAttention-ascend installed; both plugins activated).
+    combo_enabled: bool = False
+
     # Behavior controls
     defer_prefill_compression: bool = True
     min_reclaim_blocks: int = 1
@@ -144,6 +149,7 @@ class KVPressRuntimeConfig:
             seed=env_int("KVPRESS_SEED", 0) or None,
             kv_budget=env_int("KVPRESS_KV_BUDGET", 0),
             use_installed_kvpress=env_bool("KVPRESS_USE_INSTALLED", True),
+            combo_enabled=env_bool("KVPRESS_COMBO", False),
             defer_prefill_compression=env_bool("KVPRESS_DEFER_PREFILL_COMPRESSION", True),
             min_reclaim_blocks=env_int("KVPRESS_MIN_RECLAIM_BLOCKS", 1),
             max_compressions_per_step=env_int("KVPRESS_MAX_COMPRESSIONS_PER_STEP", 1),
