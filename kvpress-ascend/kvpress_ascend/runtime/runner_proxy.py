@@ -29,10 +29,17 @@ from .block_sync import (
     truncate_request_state_block_ids,
 )
 from .compression_engine import (
+    _request_block_capacity,
     _request_block_ids,
     _request_token_count,
     _table_block_size,
     compress_request,
+)
+from .thresholds import (
+    compression_length_threshold,
+    is_prefill_phase_for_limit,
+    is_request_scheduled_as_prefill,
+    resolve_request_prefill_len,
 )
 from .output_bridge import attach_events_to_output
 from .request_key_compat import (
@@ -117,6 +124,12 @@ class KVPressModelRunner:
             log_warning("runner proxy: model not found; attention hooks disabled")
             return
         hooked = self.hooks.install(model)
+        if hooked == 0:
+            log_warning(
+                "attention hooks found 0 layers; query-based presses will fall "
+                "back to recency selection (keys-only presses still score "
+                "directly from the block cache)"
+            )
         if self.config.logging_enabled:
             log_info(
                 "attention hooks installed: layers=%d press=%s ratio=%s "
@@ -153,16 +166,84 @@ class KVPressModelRunner:
         if isinstance(finished, (list, tuple, set)):
             self.state_store.cleanup_finished([str(r) for r in finished])
 
+    def _ensure_state_for_existing_request(self, req_id: str) -> Any:
+        """Backfill request state lazily from the worker surfaces when the
+        new-req registration did not run (mirrors TriAttention)."""
+        state = self.state_store.get(req_id)
+        if state is not None:
+            return state
+        prefill_len = 0
+        requests_dict = getattr(self._base_runner, "requests", None)
+        if isinstance(requests_dict, dict):
+            req_state = requests_dict.get(req_id)
+            if req_state is not None:
+                prefill_len = resolve_request_prefill_len(req_state)
+                if prefill_len <= 0:
+                    prefill_len = int(getattr(req_state, "num_prompt_tokens", 0) or 0)
+        if prefill_len <= 0:
+            input_batch = getattr(self._base_runner, "input_batch", None)
+            if input_batch is not None:
+                req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+                num_prompt = getattr(input_batch, "num_prompt_tokens", None)
+                if isinstance(req_id_to_index, dict) and num_prompt is not None:
+                    req_index = req_id_to_index.get(req_id)
+                    if isinstance(req_index, int):
+                        try:
+                            prefill_len = int(num_prompt[req_index])
+                        except Exception:
+                            pass
+        state = self.state_store.ensure(
+            str(req_id),
+            prefill_len=prefill_len,
+            protect_prefill=self.config.protect_prefill,
+        )
+        if self.config.log_decisions:
+            log_debug(
+                "backfilled runtime state for scheduled request: req=%s prefill_len=%d",
+                req_id, prefill_len,
+            )
+        return state
+
+    def _sync_worker_num_computed(self, scheduler_output: Any) -> None:
+        """Mirror vLLM's num_computed_tokens into request state each step."""
+        requests_dict = getattr(self._base_runner, "requests", None)
+        if not isinstance(requests_dict, dict):
+            return
+        for req_id, _scheduled in _scheduled_items(scheduler_output):
+            state = self.state_store.get(req_id)
+            if state is None:
+                continue
+            req_state = requests_dict.get(req_id)
+            if req_state is None:
+                continue
+            nct = int(getattr(req_state, "num_computed_tokens", 0) or 0)
+            if nct > int(state.num_computed_tokens):
+                state.num_computed_tokens = nct
+
     def _consume_signals(self, scheduler_output: Any) -> dict[str, CompressionSignal]:
         return signals_from_scheduler_output(scheduler_output)
 
     def _compression_threshold(self, block_size: int) -> int:
-        budget = self.config.kv_budget if self.config.kv_budget > 0 else int(
-            self.config.resolved_budget(1 << 30)
+        if self.config.kv_budget > 0:
+            budget = self.config.kv_budget
+        else:
+            # Ratio-based press: the scheduler cannot know the per-request
+            # budget before the length is known; use a reclaim-driven candidate
+            # (keep ~ (1-ratio)*len, so reclaim >= min_reclaim_blocks once
+            # len >= min_reclaim_blocks*block_size/ratio). The worker validates
+            # the real budget in _execute_compression.
+            ratio = max(0.01, min(0.99, float(self.config.compression_ratio)))
+            budget = max(
+                1,
+                int(max(0, self.config.min_reclaim_blocks) * max(1, block_size) / ratio),
+            )
+        return compression_length_threshold(
+            kv_budget=budget,
+            min_reclaim_blocks=self.config.min_reclaim_blocks,
+            block_size=block_size,
+            protect_prefill=self.config.protect_prefill,
+            include_prefill_in_budget=self.config.include_prefill_in_budget,
         )
-        # Signals fire once the request can reclaim at least
-        # min_reclaim_blocks blocks at the configured budget.
-        return max(1, budget + max(0, self.config.min_reclaim_blocks) * max(1, block_size))
 
     def _worker_self_triggers(
         self,
@@ -173,22 +254,35 @@ class KVPressModelRunner:
         block_size = _table_block_size(self._base_runner)
         threshold = self._compression_threshold(block_size)
         step = self._last_step
+        block_size = _table_block_size(self._base_runner)
         for req_id, scheduled_tokens in _scheduled_items(scheduler_output):
             if req_id in signals:
                 continue
-            state = self.state_store.get(req_id)
-            if state is None:
-                continue
+            state = self._ensure_state_for_existing_request(req_id)
             if state.is_compressed:
                 effective = int(state.current_cache_len)
             else:
-                # First-compression fallback: trigger from the worker-side
-                # mirrored num_computed_tokens (covers engine-core signal lag
-                # or an unpatched engine-core scheduler).
-                if int(state.num_computed_tokens) <= 0:
-                    continue
+                # First-compression self-trigger from the ACTUAL worker-side
+                # length (block capacity / mirrored num_computed) — the
+                # TriAttention philosophy: the worker derives the length
+                # itself, so engine-core signal lag or an unpatched
+                # engine-core scheduler cannot block compression.
                 effective = int(state.num_computed_tokens)
+                if effective <= 0:
+                    actual = _request_block_capacity(self._base_runner, req_id)
+                    if actual is not None:
+                        effective = int(actual)
+                if effective <= 0:
+                    continue
             if effective + scheduled_tokens <= threshold:
+                continue
+            if self.config.defer_prefill_compression and is_prefill_phase_for_limit(
+                scheduler_output=scheduler_output,
+                req_id=req_id,
+                scheduled_tokens=scheduled_tokens,
+                prefill_len=int(state.prefill_len),
+                num_computed_tokens=effective,
+            ):
                 continue
             signals[req_id] = CompressionSignal(
                 req_id=req_id,
@@ -255,7 +349,13 @@ class KVPressModelRunner:
             if total_tokens is None or total_tokens <= 0:
                 continue
 
-            if self._is_prefill_step(state, scheduled_tokens) and self.config.defer_prefill_compression:
+            if self.config.defer_prefill_compression and is_prefill_phase_for_limit(
+                scheduler_output=scheduler_output,
+                req_id=req_id,
+                scheduled_tokens=scheduled_tokens,
+                prefill_len=int(state.prefill_len),
+                num_computed_tokens=_request_block_capacity(self._base_runner, req_id),
+            ):
                 events.append(
                     {
                         "req_id": req_id,
@@ -430,6 +530,7 @@ class KVPressModelRunner:
         self.hooks.reset_step(step)
         self._register_new_requests(scheduler_output)
         self._cleanup_finished(scheduler_output)
+        self._sync_worker_num_computed(scheduler_output)
 
         signals = self._consume_signals(scheduler_output)
         signals = self._worker_self_triggers(scheduler_output, signals)

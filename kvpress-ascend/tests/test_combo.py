@@ -168,10 +168,13 @@ def test_registration_via_namedtuple_end_to_end(logs):
 
     def _schedule_with_namedtuples(self):
         out = original_schedule(self)
-        out.scheduled_new_reqs = [
-            NewScheduledRequest(r.req_id, r, 0, r.num_prompt_tokens, 1)
-            for r in self.requests.values()
-        ]
+        # Real vLLM only lists NEW requests in scheduled_new_reqs.
+        if not hasattr(self, "_sim_new_req_emitted"):
+            out.scheduled_new_reqs = [
+                NewScheduledRequest(r.req_id, r, 0, r.num_prompt_tokens, 1)
+                for r in self.requests.values()
+            ]
+            self._sim_new_req_emitted = True
         return out
 
     StubScheduler.schedule = _schedule_with_namedtuples

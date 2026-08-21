@@ -117,6 +117,16 @@ def _patched_scheduler_schedule(self):
     )
     setattr(scheduler_output, "kvpress_signals", signals)
     setattr(scheduler_output, "kvpress_step", self._kvpress_step)
+    # Scheduler heartbeat: proves the engine-core scheduler patch is alive
+    # (TriAttention-style signal accounting), every 500 steps.
+    if self._kvpress_step % 500 == 0:
+        tracker = getattr(self, "_kvpress_effective_len_tracker", None)
+        log_info(
+            "scheduler heartbeat step=%d signals=%d tracker_entries=%d",
+            self._kvpress_step,
+            len(signals),
+            len(tracker) if tracker is not None else 0,
+        )
     return scheduler_output
 
 

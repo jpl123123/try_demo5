@@ -4,4 +4,4 @@ Activation (vLLM plugin): set ``KVPRESS_ENABLE=1`` (alias ``KVPRESS=1``)
 before launching ``vllm serve``. See README.md.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

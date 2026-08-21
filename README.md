@@ -233,20 +233,31 @@ BlockTable / V1 调度器 / KV cache manager），在 CPU 上运行真实 patch 
 
 ### 探针全 0（`layers=0 hook_entered=0 seq_len=0 keep=0`，无驱逐）
 
-日志里 `[PROBE]` 全 0 说明两个问题（v0.2.0 已修复，重新 `pip install` 两个包）：
+这是 v0.2.0 之前的问题；v0.3.0 按 **TriAttention 的调度哲学**彻底重做了触发链路
+（TriAttention 在真机上真实压缩，其 worker 侧完全不依赖 hook 和 new-req 解析）：
 
-1. `layers=0`：hook 没找到解码层 —— Qwen3.5 的层在 `language_model.model.layers`
-   （Qwen3Next 在 `model.model.layers`），旧版只查了一层。新版用递归解析器定位
-   层容器（跳过 draft/MTP 模块），并只接受"成员带 self_attn/attention"的容器。
-2. `seq_len=0` + 无驱逐：请求没有注册成功 —— 真实 vLLM 的 `scheduled_new_reqs`
-   是 `NewScheduledRequest` namedtuple（字段 `req_id, request, num_computed_tokens,
-   num_prompt_tokens, num_scheduled_tokens`），旧版 `item[-1]` 取到的是数字。
-   新版按字段名解析两种形态。另外新增了**首次压缩 worker 自触发**兜底：即使
-   engine-core 的调度器信号缺失/滞后，worker 侧也能按自身 `num_computed_tokens`
-   触发第一次压缩。
+1. **worker 侧自触发（核心）**：每个压缩边界，worker 从**块表真实容量**
+   （`num_blocks_per_row × block_size`，TriAttention 的
+   `_get_actual_kv_from_model_runner` 同款）自推导请求长度并自触发压缩。
+   即使 engine-core 调度器没有信号、`scheduled_new_reqs` 解析失败、甚至
+   `layers=0`，压缩依然会执行 —— 已用专门测试验证（剥离全部调度通道后仍压缩）。
+2. **state 懒回填**：请求状态不再依赖 new-req 注册，worker 从
+   `base_runner.requests` / `input_batch.num_prompt_tokens` 回填
+   （TriAttention 的 `_ensure_state_for_existing_request` 同款）。
+3. **逻辑 prefill 判定**：prefill 门控用调度器逻辑进度（请求是否还在
+   `scheduled_new_reqs`、`num_scheduled_tokens > 1`），不再用压缩后的有效长度
+   （TriAttention 的 `is_prefill_phase_for_limit` 同款），避免解码阶段被误判。
+4. `layers=0`：hook 找不到层时不再阻塞 —— keys-only press（Knorm/StreamingLLM/
+   Random）直接从块缓存 gather K 打分；query 类 press（SnapKV/TOVA/Observed）
+   自动退化为 recency 选择。SqueezeAttention 无 hidd_data 时预算退化为
+   uniform `SQUEEZE_INI_SIZE`。
+5. 调度器新增心跳日志（每 500 步一行 `scheduler heartbeat step=... signals=...
+   tracker_entries=...`），从 engine-core 日志即可确认调度器 patch 是否活着。
 
-升级后验证：`[PROBE]` 应出现 `layers=36 ... budgets_ready=1 ... seq_len>0`，
-且出现 `COMPRESS` / `[CLUSTER]` 事件行。
+**务必重新安装**：`pip install ./kvpress-ascend`（v0.3.0）+
+`pip install ./SqueezeAttention-ascend`（v0.2.0）。升级后验证：
+`[PROBE]` 应出现 `seq_len>0`，并出现 `COMPRESS` / `[CLUSTER]` 事件行；
+即使探针里 `layers=0`，只要出现 `COMPRESS ... reclaimed_blocks=...` 即压缩生效。
 
 ### `ValueError: too many values to unpack (expected 24)`（启动 profile_run 阶段）
 

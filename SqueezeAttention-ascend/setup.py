@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="SqueezeAttention-ascend",
-    version="0.1.0",
+    version = "0.2.0",
     description=(
         "SqueezeAttention monkeypatch adapter for vLLM-Ascend v0.23.0: converts "
         "the SqueezeAttention 2D KV-budget mechanism (layer-wise KMeans budgets x "

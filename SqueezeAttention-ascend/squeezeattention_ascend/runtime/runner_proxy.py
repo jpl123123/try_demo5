@@ -25,11 +25,17 @@ from . import input_patch_state as _patch_state
 from .attention_hooks import SqueezeAttentionHooks
 from .block_sync import apply_worker_block_reclaim, truncate_request_state_block_ids
 from .compression_engine import (
+    _request_block_capacity,
     _request_block_ids,
     _request_token_count,
     _table_block_size,
     compress_request,
     finalize_budgets,
+)
+from .thresholds import (
+    compression_length_threshold,
+    is_prefill_phase_for_limit,
+    resolve_request_prefill_len,
 )
 from .output_bridge import attach_events_to_output
 from .request_key_compat import (
@@ -103,6 +109,12 @@ class SqueezeAttentionModelRunner:
             log_warning("runner proxy: model not found; attention hooks disabled")
             return
         hooked = self.hooks.install(model)
+        if hooked == 0:
+            log_warning(
+                "attention hooks found 0 layers; layer-importance capture "
+                "(hidd_data) disabled -> budgets fall back to the uniform "
+                "initial budget (SQUEEZE_INI_SIZE)"
+            )
         if self.config.logging_enabled:
             log_info(
                 "attention hooks installed: layers=%d mode=%s ini_size=%.3f "
@@ -139,6 +151,39 @@ class SqueezeAttentionModelRunner:
         if isinstance(finished, (list, tuple, set)):
             self.state_store.cleanup_finished([str(r) for r in finished])
 
+    def _ensure_state_for_existing_request(self, req_id: str) -> Any:
+        """Backfill request state lazily from worker surfaces (TriAttention
+        philosophy: never depend on new-req parsing for correctness)."""
+        state = self.state_store.get(req_id)
+        if state is not None:
+            return state
+        prefill_len = 0
+        requests_dict = getattr(self._base_runner, "requests", None)
+        if isinstance(requests_dict, dict):
+            req_state = requests_dict.get(req_id)
+            if req_state is not None:
+                prefill_len = resolve_request_prefill_len(req_state)
+                if prefill_len <= 0:
+                    prefill_len = int(getattr(req_state, "num_prompt_tokens", 0) or 0)
+        if prefill_len <= 0:
+            input_batch = getattr(self._base_runner, "input_batch", None)
+            if input_batch is not None:
+                req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+                num_prompt = getattr(input_batch, "num_prompt_tokens", None)
+                if isinstance(req_id_to_index, dict) and num_prompt is not None:
+                    req_index = req_id_to_index.get(req_id)
+                    if isinstance(req_index, int):
+                        try:
+                            prefill_len = int(num_prompt[req_index])
+                        except Exception:
+                            pass
+        state = self.state_store.ensure(str(req_id), prefill_len=prefill_len)
+        if "importance" not in state.extra:
+            state.extra["importance"] = LayerImportanceAccumulator()
+            state.extra["budgets_ready"] = False
+            state.extra["sliding_windows"] = []
+        return state
+
     def _sync_worker_num_computed(self, scheduler_output: Any) -> None:
         """Mirror vLLM's num_computed_tokens into request state each step
         (kvpress's cache_position equivalent for prefill tracking)."""
@@ -164,8 +209,27 @@ class SqueezeAttentionModelRunner:
         return self.config.resolved_k(budgets, block_size, total_tokens)
 
     def _compression_threshold(self, state: Any, block_size: int) -> int:
-        keep_count = self._request_keep_count(state, 1 << 30, block_size)
-        return max(1, keep_count + max(0, self.config.min_reclaim_blocks) * max(1, block_size))
+        if self.config.kv_budget > 0 or (
+            state.extra.get("budgets_ready") and state.extra.get("sliding_windows")
+        ):
+            keep_count = self._request_keep_count(state, 1 << 30, block_size)
+        else:
+            # Budgets not learned yet: reclaim-driven candidate
+            # (len >= min_reclaim_blocks*block_size/(1-ini) reclaims).
+            keep_fraction = max(0.05, min(0.95, float(self.config.ini_size)))
+            keep_count = max(
+                1,
+                int(
+                    max(0, self.config.min_reclaim_blocks)
+                    * max(1, block_size)
+                    / max(1e-3, 1.0 - keep_fraction)
+                ),
+            )
+        return compression_length_threshold(
+            kv_budget=keep_count,
+            min_reclaim_blocks=self.config.min_reclaim_blocks,
+            block_size=block_size,
+        )
 
     def _worker_self_triggers(
         self,
@@ -176,19 +240,27 @@ class SqueezeAttentionModelRunner:
         for req_id, scheduled_tokens in _scheduled_items(scheduler_output):
             if req_id in signals:
                 continue
-            state = self.state_store.get(req_id)
-            if state is None:
-                continue
+            state = self._ensure_state_for_existing_request(req_id)
             threshold = self._compression_threshold(state, block_size)
             if state.is_compressed:
                 effective = int(state.current_cache_len)
             else:
-                # First-compression fallback from the worker-side mirrored
-                # num_computed_tokens (engine-core signal lag safety net).
-                if int(state.num_computed_tokens) <= 0:
-                    continue
                 effective = int(state.num_computed_tokens)
+                if effective <= 0:
+                    actual = _request_block_capacity(self._base_runner, req_id)
+                    if actual is not None:
+                        effective = int(actual)
+                if effective <= 0:
+                    continue
             if effective + scheduled_tokens <= threshold:
+                continue
+            if self.config.defer_prefill_compression and is_prefill_phase_for_limit(
+                scheduler_output=scheduler_output,
+                req_id=req_id,
+                scheduled_tokens=scheduled_tokens,
+                prefill_len=int(state.prefill_len),
+                num_computed_tokens=effective,
+            ):
                 continue
             signals[req_id] = CompressionSignal(
                 req_id=req_id,
@@ -279,8 +351,32 @@ class SqueezeAttentionModelRunner:
             num_layers = self.hooks.layer_count
             if num_layers <= 0:
                 num_layers = len(getattr(state.extra, "sliding_windows", [])) or 1
-            importance = accumulator.means(num_layers) if accumulator is not None else [0.0] * num_layers
-            budgets, diagnostics = finalize_budgets(
+            if accumulator is None or not bool(accumulator):
+                # No hidd_data captured (0 layers hooked / compiled prefill):
+                # fall back to the uniform initial budget for every layer
+                # (TriAttention-style uniform budget) instead of clustering
+                # degenerate all-zero importance.
+                budgets = [
+                    max(1, int(self.config.ini_size * prefill_len))
+                ] * num_layers
+                diagnostics = {
+                    "num_layers": num_layers,
+                    "n_clusters": 0,
+                    "fallback": "uniform_ini_no_hidd_data",
+                    "class_sizes": {},
+                    "class_ids": [],
+                    "prompt_len": prefill_len,
+                    "ini_size": self.config.ini_size,
+                }
+                if self.config.log_budgets:
+                    cluster_log(
+                        "budgets(req=%s) fallback=uniform_ini no_hidd_data layers=%d "
+                        "prompt_len=%d ini=%.3f budgets=%s",
+                        req_id, num_layers, prefill_len, self.config.ini_size, budgets,
+                    )
+            else:
+                importance = accumulator.means(num_layers)
+                budgets, diagnostics = finalize_budgets(
                 base_runner=self._base_runner,
                 req_id=req_id,
                 layer_importance=importance,
@@ -339,9 +435,12 @@ class SqueezeAttentionModelRunner:
             if total_tokens is None or total_tokens <= 0:
                 continue
 
-            if (
-                self.config.defer_prefill_compression
-                and 0 < int(state.num_computed_tokens or 0) < int(state.prefill_len or 0)
+            if self.config.defer_prefill_compression and is_prefill_phase_for_limit(
+                scheduler_output=scheduler_output,
+                req_id=req_id,
+                scheduled_tokens=scheduled_tokens,
+                prefill_len=int(state.prefill_len),
+                num_computed_tokens=_request_block_capacity(self._base_runner, req_id),
             ):
                 events.append(
                     {

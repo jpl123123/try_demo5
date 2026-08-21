@@ -75,7 +75,8 @@ def _request_block_ids(base_runner: Any, req_id: str, gid: int = 0) -> Optional[
     return None
 
 
-def _request_token_count(base_runner: Any, req_id: str, block_size: int) -> Optional[int]:
+def _request_block_capacity(base_runner: Any, req_id: str) -> Optional[int]:
+    """Authoritative worker-side KV length: block-table row capacity."""
     input_batch = getattr(base_runner, "input_batch", None)
     if input_batch is None:
         return None
@@ -85,14 +86,56 @@ def _request_token_count(base_runner: Any, req_id: str, block_size: int) -> Opti
     req_index = req_id_to_index.get(req_id)
     if not isinstance(req_index, int):
         return None
-    num_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
-    if num_computed is not None:
+    block_table_obj = getattr(input_batch, "block_table", None)
+    if block_table_obj is None:
+        return None
+    inner = getattr(block_table_obj, "block_tables", None)
+    tables = list(inner) if isinstance(inner, (list, tuple)) and inner else [block_table_obj]
+    capacities: list[int] = []
+    for table in tables:
         try:
-            value = int(num_computed[req_index])
-            if value > 0:
-                return value
+            n_blocks = int(table.num_blocks_per_row[req_index])
         except Exception:
-            pass
+            continue
+        try:
+            bs = int(table.block_size)
+        except Exception:
+            continue
+        if n_blocks > 0 and bs > 0:
+            capacities.append(n_blocks * bs)
+    return max(capacities) if capacities else None
+
+
+def _request_token_count(base_runner: Any, req_id: str, block_size: int) -> Optional[int]:
+    """Block capacity first (authoritative), then input-batch mirror, then
+    request state (TriAttention philosophy)."""
+    capacity = _request_block_capacity(base_runner, req_id)
+    if capacity is not None and capacity > 0:
+        return capacity
+    input_batch = getattr(base_runner, "input_batch", None)
+    if input_batch is not None:
+        req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+        if isinstance(req_id_to_index, dict):
+            req_index = req_id_to_index.get(req_id)
+            if isinstance(req_index, int):
+                num_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
+                if num_computed is not None:
+                    try:
+                        value = int(num_computed[req_index])
+                        if value > 0:
+                            return value
+                    except Exception:
+                        pass
+    requests_dict = getattr(base_runner, "requests", None)
+    if isinstance(requests_dict, dict):
+        req_state = requests_dict.get(req_id)
+        if req_state is not None:
+            try:
+                value = int(getattr(req_state, "num_computed_tokens", 0) or 0)
+                if value > 0:
+                    return value
+            except Exception:
+                pass
     block_ids = _request_block_ids(base_runner, req_id)
     if block_ids:
         return len(block_ids) * block_size

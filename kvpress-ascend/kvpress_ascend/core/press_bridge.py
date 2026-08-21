@@ -205,6 +205,28 @@ _PRESS_SCORERS = {
     "ObservedAttentionPress": score_observed_attention,
 }
 
+# Presses whose scoring requires captured queries. When the attention hooks
+# are unavailable (compiled prefill, 0 layers found), selection falls back to
+# the StreamingLLM recency set at the same keep count (TriAttention-style
+# recency philosophy) instead of failing the step.
+_QUERY_REQUIRED_PRESSES = frozenset(
+    {"SnapKVPress", "TOVAPress", "ObservedAttentionPress"}
+)
+
+
+def _recency_fallback_keep_indices(
+    keys: torch.Tensor,
+    n_kept: int,
+    n_sink: int = 4,
+) -> torch.Tensor:
+    """StreamingLLM-style recency keep set (sink + newest), per-head uniform."""
+    k_len = keys.shape[2]
+    keep = list(range(min(n_sink, k_len))) + list(
+        range(k_len - max(0, n_kept - n_sink), k_len)
+    )
+    indices = torch.as_tensor(keep, device=keys.device, dtype=torch.long)
+    return indices.unsqueeze(0).expand(keys.shape[1], -1).contiguous()
+
 
 def score_press(
     press: Any,
@@ -248,6 +270,10 @@ def select_keep_indices(
     original causal token order (mathematically equivalent for attention, and
     deterministic for debugging/reclaim).
     """
+    if queries is None and press.__class__.__name__ in _QUERY_REQUIRED_PRESSES:
+        return _recency_fallback_keep_indices(
+            keys, n_kept, n_sink=int(getattr(press, "n_sink", 4) or 4)
+        )
     scores = score_press(press, keys, queries=queries)
     k_len = keys.shape[2]
     if n_kept >= k_len:
